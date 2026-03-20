@@ -1,10 +1,14 @@
-"""Configuration management for KVM MCP server."""
+"""Configuration management for KVM MCP server.
+
+Includes RBAC configuration adapted from coolnyx/libvirt-mcp-server (MIT License).
+See: https://github.com/coolnyx/libvirt-mcp-server
+"""
 
 import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +21,30 @@ class HostConfig(BaseModel):
     ssh_key: str = "~/.ssh/id_rsa"
     allowed_disk_paths: str = "/var/lib/libvirt/images"
     allowed_iso_paths: str = "/var/lib/libvirt/images,/home"
+
+
+class SecurityConfig(BaseModel):
+    """Security and RBAC configuration.
+    
+    Based on configuration structure from coolnyx/libvirt-mcp-server (MIT License).
+    """
+
+    auth_required: bool = Field(
+        default=False, 
+        description="Whether authentication is required for MCP operations"
+    )
+    max_concurrent_ops: int = Field(
+        default=20, 
+        description="Maximum number of concurrent operations allowed"
+    )
+    allowed_operations: list[str] = Field(
+        default=["*"], 
+        description="List of allowed operation patterns. Use '*' for all, or specific patterns like 'kvm_*', 'guest_*'"
+    )
+    rate_limit_per_minute: int = Field(
+        default=300, 
+        description="Maximum operations per minute per client"
+    )
 
 
 class Settings(BaseSettings):
@@ -40,6 +68,22 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
     disable_sudo: bool = False
+    
+    # Security and RBAC settings
+    security_auth_required: bool = False
+    security_max_concurrent_ops: int = 20
+    security_allowed_operations: str = "*"
+    security_rate_limit_per_minute: int = 300
+
+    @property
+    def security(self) -> SecurityConfig:
+        """Get security configuration from environment variables."""
+        return SecurityConfig(
+            auth_required=self.security_auth_required,
+            max_concurrent_ops=self.security_max_concurrent_ops,
+            allowed_operations=self.security_allowed_operations.split(",") if self.security_allowed_operations != "*" else ["*"],
+            rate_limit_per_minute=self.security_rate_limit_per_minute,
+        )
 
 
 def load_host_configs(settings: Settings) -> tuple[list[HostConfig], str]:

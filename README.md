@@ -18,11 +18,21 @@ cp env.example .env
 # Run standalone (stdio transport)
 source kvm-venv/bin/activate  # or .venv/bin/activate
 python -m app.mcp_server
+
+# Run as HTTP service
+export MCP_TRANSPORT=http
+export MCP_HOST=0.0.0.0
+export MCP_PORT=8000
+python -m app.mcp_server
+
+# Run with streamable HTTP transport
+export MCP_TRANSPORT=streamable-http
+python -m app.mcp_server
 ```
 
 ## What it provides
 
-- **28 tools**: Fleet management, VM lifecycle (create/start/stop/restart/delete/clone), snapshots, disks, networks, boot order, guest agent operations
+- **34 tools**: Fleet management, VM lifecycle (create/start/stop/restart/delete/clone), snapshots, disks, networks, boot order, guest agent operations, plus outcome-focused idempotent tools
 - **8 resources**: Host status, VM lists, network lists, storage pools, VM details with snapshots and disk layouts  
 - **8 prompts**: Guided workflows for provisioning, cloning, snapshots, investigation, deletion, fleet audit, disk resizing, network troubleshooting
 - **Multi-host support**: Manage VMs across multiple KVM hosts with centralized fleet overview
@@ -35,6 +45,7 @@ python -m app.mcp_server
 - **Provisioning**: Boot from ISO with guided OS installation workflows
 - **Templates**: Clone existing VMs with optional resource modifications
 - **Boot Control**: Manage boot device order (hd, cdrom, network, fd)
+- **Outcome-Focused Tools**: Idempotent operations like `ensure_vm_running`, `ensure_vm_exists`, `ensure_snapshot_exists` that achieve desired state regardless of current state
 
 ### Data Protection  
 - **Snapshots**: Create, list, delete, and restore VM snapshots with safety workflows
@@ -47,7 +58,21 @@ python -m app.mcp_server
 - **Path Security**: Configurable allowed paths for disks and ISO files
 
 ### Network Operations
-- **Network Management**: List, attach, and detach libvirt networks  
+- **Network Management**: List, attach, and detach libvirt networks
+
+### Security & Access Control
+- **RBAC System**: Role-based access control with predefined roles (admin, operator, developer, viewer, guest)
+- **Path Validation**: Runtime enforcement of allowed disk and ISO paths with path traversal prevention
+- **Confirmation Prompts**: Required confirmation for destructive operations (delete VM, restore snapshot, force stop)
+- **Rate Limiting**: Per-user operation rate limits and concurrent operation controls
+- **Host Restrictions**: Limit user access to specific KVM hosts
+- **VM Pattern Matching**: Restrict user access to VMs matching specific name patterns
+
+### Transport Options
+- **Multiple Transports**: Support for stdio, HTTP, and streamable HTTP protocols
+- **HTTP API**: RESTful web service mode for network access and integration
+- **Authentication**: Optional token-based authentication for HTTP transport
+- **CORS Support**: Configurable cross-origin resource sharing for web integration  
 - **IP Discovery**: Automatic IP address detection via guest agent
 - **Network Diagnostics**: Built-in network troubleshooting workflows
 
@@ -175,6 +200,86 @@ bash scripts/setup_remote_host.sh
 # On this machine (MCP client)
 bash scripts/setup_ssh_keys.sh <kvm-host>
 ```
+
+## Docker Deployment
+
+Run the KVM MCP server in containers with full libvirt access:
+
+```bash
+# Build and run with Docker Compose
+docker-compose up --build
+
+# Or build manually
+docker build -t kvm-mcp-server .
+
+# Run with local libvirt access (privileged mode required)
+docker run -d \
+  --name kvm-mcp-server \
+  --privileged \
+  -v /var/run/libvirt:/var/run/libvirt \
+  -v ~/.ssh:/root/.ssh:ro \
+  -v ./config:/app/config:ro \
+  -v ./.env:/app/.env:ro \
+  kvm-mcp-server
+
+# For multi-host deployments, mount your hosts.yaml config:
+# -v ./config/hosts.yaml:/app/config/hosts.yaml:ro
+```
+
+## RBAC & Security Configuration
+
+Enhanced role-based access control with operation filtering and rate limiting:
+
+```bash
+# Enable RBAC in .env
+SECURITY_AUTH_REQUIRED=true
+SECURITY_MAX_CONCURRENT_OPS=10
+SECURITY_RATE_LIMIT_PER_MINUTE=100
+
+# Allow only specific operations (comma-separated patterns)
+SECURITY_ALLOWED_OPERATIONS=kvm_list_*,guest_ping,guest_get_*
+
+# Or allow all operations in development
+SECURITY_ALLOWED_OPERATIONS=*
+```
+
+**Operation Patterns:**
+- `*` - Allow all operations
+- `kvm_*` - All KVM operations  
+- `guest_*` - All guest agent operations
+- `kvm_list_*,kvm_get_*` - Read-only VM operations
+- `kvm_create_*,kvm_delete_*` - VM lifecycle operations
+
+## Attribution & Acknowledgments
+
+This project incorporates security and deployment concepts from the following open source projects:
+
+### libvirt-mcp-server (MIT License)
+**Original Project:** https://github.com/coolnyx/libvirt-mcp-server  
+**License:** MIT License  
+**Attribution:** Security configuration structure, RBAC operation filtering concepts, and Docker deployment patterns adapted from coolnyx/libvirt-mcp-server
+
+**Features Adapted:**
+- RBAC configuration with `allowed_operations` patterns
+- Security middleware architecture  
+- Docker containerization approach with privileged libvirt access
+- Enhanced path validation security layers
+
+All adapted code maintains original copyright notices where applicable and is relicensed under AGPL v3 as permitted by the MIT License.
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0** (AGPL v3).
+
+See the [LICENSE](LICENSE) file for the full license text.
+
+**Key points:**
+- ✅ Free to use, modify, and distribute
+- ✅ Can incorporate MIT and other permissive licensed code  
+- ⚠️ **Network copyleft:** If you run a modified version as a network service, you must make the source code available to users
+- ⚠️ All modifications and derivative works must be AGPL v3 licensed
+
+**Why AGPL v3?** This ensures that improvements to KVM management infrastructure remain open source and available to the community, even when deployed as cloud services.
 
 ## Related
 

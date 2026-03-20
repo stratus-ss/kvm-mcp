@@ -1,6 +1,10 @@
-"""KVM service for VM lifecycle management using libvirt Python bindings."""
+"""KVM service for VM lifecycle management using libvirt Python bindings.
+
+Enhanced with security validation inspired by coolnyx/libvirt-mcp-server (MIT License).
+"""
 
 import os
+import pathlib
 import shlex
 import subprocess
 import time
@@ -11,6 +15,7 @@ import libvirt
 
 from app.config import get_settings
 from app.services.connection_manager import ConnectionManager
+from app.utils.security import PathSecurityValidator, SecurityViolationError
 
 _STATE_MAP = {
     libvirt.VIR_DOMAIN_NOSTATE: "no state",
@@ -37,6 +42,33 @@ class KVMService:
 
     def __init__(self, conn_mgr: ConnectionManager):
         self._conn_mgr = conn_mgr
+
+    def _validate_disk_path(self, disk_path: str, host: str = "") -> None:
+        """Validate disk path is under allowed directories for security.
+        
+        Enhanced security validation inspired by libvirt-mcp-server.
+        """
+        host_config = self._conn_mgr.get_host_config(host)
+        try:
+            PathSecurityValidator.validate_disk_path(disk_path, host_config)
+        except SecurityViolationError as e:
+            # Convert to ValueError for backward compatibility
+            raise ValueError(f"Security violation: {e}") from e
+
+    def _validate_iso_path(self, iso_path: str, host: str = "") -> None:
+        """Validate ISO path is under allowed directories for security.
+        
+        Enhanced security validation inspired by libvirt-mcp-server.
+        """
+        if not iso_path:
+            return  # Optional path
+            
+        host_config = self._conn_mgr.get_host_config(host)
+        try:
+            PathSecurityValidator.validate_iso_path(iso_path, host_config)
+        except SecurityViolationError as e:
+            # Convert to ValueError for backward compatibility
+            raise ValueError(f"Security violation: {e}") from e
 
     def _state_str(self, state_id: int) -> str:
         return _STATE_MAP.get(state_id, "unknown")
@@ -377,6 +409,9 @@ class KVMService:
     ) -> tuple[int, str, str]:
         """Attach a qcow2 disk to a VM."""
         try:
+            # Validate disk path against security constraints
+            self._validate_disk_path(disk_path, host)
+            
             dom = self._conn_mgr.get_domain(host, vm_name)
             target = self._next_disk_target(dom)
             if target is None:
@@ -390,6 +425,8 @@ class KVMService:
             )
             dom.attachDevice(disk_xml)
             return 0, f"Disk attached as {target}", ""
+        except ValueError as e:
+            return 1, "", str(e)
         except libvirt.libvirtError as e:
             return 1, "", str(e)
 
@@ -418,6 +455,12 @@ class KVMService:
         self, disk_path: str, new_size_gb: int, host: str = "", timeout: int = 300,
     ) -> tuple[int, str, str]:
         """Resize a qcow2 disk image (subprocess, supports remote via SSH)."""
+        try:
+            # Validate disk path against security constraints
+            self._validate_disk_path(disk_path, host)
+        except ValueError as e:
+            return 1, "", str(e)
+            
         return self._run_ssh_command(
             host, ["qemu-img", "resize", disk_path, f"{new_size_gb}G"], timeout,
         )
@@ -426,6 +469,12 @@ class KVMService:
         self, disk_path: str, size_gb: int, host: str = "", timeout: int = 600,
     ) -> tuple[int, str, str]:
         """Create a new qcow2 disk image (subprocess, supports remote via SSH)."""
+        try:
+            # Validate disk path against security constraints
+            self._validate_disk_path(disk_path, host)
+        except ValueError as e:
+            return 1, "", str(e)
+            
         return self._run_ssh_command(
             host, ["qemu-img", "create", "-f", "qcow2", disk_path, f"{size_gb}G"], timeout,
         )
@@ -498,20 +547,33 @@ class KVMService:
     def create_vm(
         self, vm_name: str, memory_mb: int = 2048, vcpus: int = 2,
         disk_path: Optional[str] = None, iso_path: Optional[str] = None,
-        os_variant: Optional[str] = None, host: str = "", timeout: int = 600,
+        os_variant: Optional[str] = None, network: str = "network=default",
+        host: str = "", timeout: int = 600,
     ) -> tuple[int, str, str]:
         """Create a new VM via virt-install (subprocess, supports remote)."""
+        try:
+            # Validate paths against security constraints
+            if disk_path:
+                self._validate_disk_path(disk_path, host)
+            if iso_path:
+                self._validate_iso_path(iso_path, host)
+        except ValueError as e:
+            return 1, "", str(e)
+            
         config = self._conn_mgr.get_host_config(host)
+        # Use local URI when command runs on the remote host via SSH
+        connect_uri = "qemu:///system" if not self._is_local_uri(config.uri) else config.uri
         cmd = [
             "virt-install",
-            "--connect", config.uri,
+            "--connect", connect_uri,
             "--name", vm_name,
             "--memory", str(memory_mb),
             "--vcpus", str(vcpus),
             "--disk", f"path={disk_path},format=qcow2",
-            "--network", "network=default",
+            "--network", network,
             "--graphics", "vnc",
             "--noautoconsole",
+            "--events", "on_reboot=restart",
             "--osinfo", "detect=on,require=off",
             "--channel", "unix,target.type=virtio,target.name=org.qemu.guest_agent.0",
         ]
@@ -537,9 +599,11 @@ class KVMService:
             return 1, "", f"Target VM '{target_vm_name}' already exists"
 
         config = self._conn_mgr.get_host_config(host)
+        # Use local URI when command runs on the remote host via SSH
+        connect_uri = "qemu:///system" if not self._is_local_uri(config.uri) else config.uri
         cmd = [
             "virt-clone",
-            "--connect", config.uri,
+            "--connect", connect_uri,
             "--original", source_vm_name,
             "--name", target_vm_name, "--auto-clone",
         ]

@@ -10,6 +10,9 @@ from mcp.server.fastmcp import FastMCP
 from app.dependencies import get_services
 from app.models.vm import validate_vm_name, validate_snapshot_name
 from app.utils.audit import audited_tool, audited_resource
+from app.utils.rbac_auth import rbac_protected, viewer_or_higher, operator_or_higher
+from app.config import get_settings
+from app.middleware.rbac import create_rbac_middleware
 
 SERVER_INSTRUCTIONS = """\
 MCP server for managing KVM/libvirt virtual machines across one or more hosts.
@@ -32,7 +35,7 @@ default host.  Use `kvm_list_hosts` to discover available hosts and
 | Snapshots      | kvm_create_snapshot, kvm_list_snapshots, kvm_delete_snapshot, kvm_restore_snapshot |
 | Disks          | kvm_list_disks, kvm_attach_disk, kvm_detach_disk, kvm_resize_disk |
 | Networks       | kvm_list_networks, kvm_attach_network, kvm_detach_network |
-| Guest agent    | guest_ping, guest_get_network, guest_get_ip, guest_exec, guest_inject_ssh_key |
+| Guest agent    | guest_ping, guest_get_network, guest_get_ip, guest_exec, guest_inject_ssh_key, guest_set_hostname |
 
 ## Common workflows
 
@@ -112,6 +115,10 @@ grep, ss, lsblk, lscpu, mount, id, stat, findmnt.
 
 mcp = FastMCP("KVM Manager", instructions=SERVER_INSTRUCTIONS)
 
+# Initialize RBAC middleware (based on libvirt-mcp-server approach)
+_settings = get_settings()
+rbac_middleware = create_rbac_middleware(_settings.security) if _settings.security.auth_required or _settings.security.allowed_operations != ["*"] else None
+
 
 def _services():
     return get_services()
@@ -121,12 +128,32 @@ def _format_error(operation: str, stderr: str) -> str:
     return f"Failed to {operation}: {stderr.strip() or 'unknown error'}"
 
 
+def _apply_rbac_if_enabled(tool_name: str):
+    """Apply RBAC decorator if enabled."""
+    def decorator(func):
+        return rbac_protected(tool_name)(func)
+    return decorator
+
+
+def _requires_confirmation(operation: str, details: str) -> str:
+    """Return a confirmation message for destructive operations."""
+    return (
+        f"⚠️  DESTRUCTIVE OPERATION CONFIRMATION REQUIRED ⚠️\n\n"
+        f"You are about to: {operation}\n"
+        f"Details: {details}\n\n"
+        f"This operation cannot be undone. To proceed, call this tool again with "
+        f"the additional parameter 'confirm=True'.\n\n"
+        f"Example: {operation.lower().replace(' ', '_')}(..., confirm=True)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fleet Tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 @audited_tool
+@rbac_protected("kvm_list_hosts")
 async def kvm_list_hosts() -> str:
     """List all configured KVM hosts with their connection status."""
     conn_mgr = _services().connection_manager
@@ -226,13 +253,14 @@ async def kvm_start_vm(vm_name: str, host: str = "") -> str:
 
 @mcp.tool()
 @audited_tool
-async def kvm_stop_vm(vm_name: str, force: bool = False, host: str = "") -> str:
+async def kvm_stop_vm(vm_name: str, force: bool = False, host: str = "", confirm: bool = False) -> str:
     """Stop a running virtual machine.
 
     Args:
         vm_name: Name of the virtual machine to stop
         force: If True, force stop (destroy) the VM instead of graceful shutdown
         host: Target KVM host (empty for default)
+        confirm: Set to True to confirm force stop operation
     """
     validate_vm_name(vm_name)
     svc = _services().kvm_service
@@ -243,6 +271,14 @@ async def kvm_stop_vm(vm_name: str, force: bool = False, host: str = "") -> str:
         return f"VM '{vm_name}' not found"
     if vm["status"] != "running":
         return f"VM '{vm_name}' is not running"
+
+    # Require confirmation for force stop (potential data loss)
+    if force and not confirm:
+        return _requires_confirmation(
+            f"Force stop VM '{vm_name}'",
+            f"Force stop may cause data loss or corruption. Use graceful shutdown instead unless VM is unresponsive. "
+            f"VM: {vm_name}, Host: {host or 'default'}"
+        )
 
     rc, stdout, stderr = await asyncio.to_thread(svc.stop_vm, vm_name, force, host)
     if rc != 0:
@@ -277,6 +313,7 @@ async def kvm_restart_vm(vm_name: str, force: bool = False, host: str = "") -> s
 
 @mcp.tool()
 @audited_tool
+@rbac_protected("kvm_create_vm")
 async def kvm_create_vm(
     name: str,
     memory_mb: int = 2048,
@@ -285,6 +322,7 @@ async def kvm_create_vm(
     disk_path: str = "/var/lib/libvirt/images",
     iso_path: Optional[str] = None,
     os_variant: Optional[str] = None,
+    network: str = "network=default",
     host: str = "",
 ) -> str:
     """Create a new virtual machine.
@@ -297,6 +335,7 @@ async def kvm_create_vm(
         disk_path: Base directory for the disk image
         iso_path: Path to ISO image for OS installation (optional)
         os_variant: OS variant hint for virt-install (e.g. ubuntu24.04)
+        network: Network spec passed to virt-install --network (e.g. bridge=br0, network=default)
         host: Target KVM host (empty for default)
     """
     validate_vm_name(name)
@@ -314,7 +353,8 @@ async def kvm_create_vm(
     rc, _, stderr = await asyncio.to_thread(
         svc.create_vm,
         vm_name=name, memory_mb=memory_mb, vcpus=vcpus,
-        disk_path=disk_file, iso_path=iso_path, os_variant=os_variant, host=host,
+        disk_path=disk_file, iso_path=iso_path, os_variant=os_variant,
+        network=network, host=host,
     )
     if rc != 0:
         return _format_error("create VM", stderr)
@@ -323,8 +363,9 @@ async def kvm_create_vm(
 
 @mcp.tool()
 @audited_tool
+@rbac_protected("kvm_delete_vm")
 async def kvm_delete_vm(
-    vm_name: str, remove_storage: bool = False, host: str = "",
+    vm_name: str, remove_storage: bool = False, host: str = "", confirm: bool = False,
 ) -> str:
     """Delete a virtual machine. The VM must be stopped first.
 
@@ -332,6 +373,7 @@ async def kvm_delete_vm(
         vm_name: Name of the virtual machine to delete
         remove_storage: If True, also remove associated disk images
         host: Target KVM host (empty for default)
+        confirm: Set to True to confirm destructive operation
     """
     validate_vm_name(vm_name)
     svc = _services().kvm_service
@@ -342,6 +384,14 @@ async def kvm_delete_vm(
         return f"VM '{vm_name}' not found"
     if vm["status"] == "running":
         return f"VM '{vm_name}' is running -- stop it first"
+
+    # Require confirmation for VM deletion
+    if not confirm:
+        storage_note = " and all associated disk images" if remove_storage else ""
+        return _requires_confirmation(
+            f"Delete VM '{vm_name}'{storage_note}",
+            f"VM: {vm_name}, Remove storage: {remove_storage}, Host: {host or 'default'}"
+        )
 
     rc, _, stderr = await asyncio.to_thread(svc.delete_vm, vm_name, remove_storage, host)
     if rc != 0:
@@ -505,16 +555,27 @@ async def kvm_delete_snapshot(vm_name: str, snapshot_name: str, host: str = "") 
 
 @mcp.tool()
 @audited_tool
-async def kvm_restore_snapshot(vm_name: str, snapshot_name: str, host: str = "") -> str:
+@rbac_protected("kvm_restore_snapshot")
+async def kvm_restore_snapshot(vm_name: str, snapshot_name: str, host: str = "", confirm: bool = False) -> str:
     """Restore a VM to a previous snapshot state. The VM must be stopped.
 
     Args:
         vm_name: Name of the virtual machine
         snapshot_name: Name of the snapshot to restore
         host: Target KVM host (empty for default)
+        confirm: Set to True to confirm destructive operation
     """
     validate_vm_name(vm_name)
     validate_snapshot_name(snapshot_name)
+    
+    # Require confirmation for snapshot restoration (data loss)
+    if not confirm:
+        return _requires_confirmation(
+            f"Restore VM '{vm_name}' to snapshot '{snapshot_name}'",
+            f"This will revert all changes made since the snapshot was created. "
+            f"VM: {vm_name}, Snapshot: {snapshot_name}, Host: {host or 'default'}"
+        )
+    
     svc = _services().kvm_service
     rc, _, stderr = await asyncio.to_thread(
         svc.restore_snapshot, vm_name, snapshot_name, host,
@@ -808,6 +869,31 @@ async def guest_inject_ssh_key(vm_name: str, public_key: str, host: str = "") ->
     return f"SSH key injection failed (exit code {exit_code})"
 
 
+@mcp.tool()
+@audited_tool
+@rbac_protected(operator_or_higher)
+async def guest_set_hostname(vm_name: str, hostname: str, host: str = "") -> str:
+    """Set the hostname inside a VM via the QEMU guest agent.
+
+    Args:
+        vm_name: Name of the virtual machine
+        hostname: New hostname (RFC 1123 compliant)
+        host: Target KVM host (empty for default)
+    """
+    validate_vm_name(vm_name)
+    svc = _services().guest_agent_service
+    rc, response = await asyncio.to_thread(svc.set_hostname, vm_name, hostname, host)
+    if rc != 0:
+        error = response.get("error", "unknown error")
+        return f"Failed to set hostname: {error}"
+    exit_code = response.get("exitcode")
+    success = exit_code == 0 if exit_code is not None else True
+    if success:
+        return f"Hostname of VM '{vm_name}' set to '{hostname}'"
+    stderr = response.get("err-data", "")
+    return f"hostnamectl failed (exit code {exit_code}): {stderr}"
+
+
 # ---------------------------------------------------------------------------
 # MCP Resources (read-only data)
 # ---------------------------------------------------------------------------
@@ -1070,8 +1156,207 @@ def network_troubleshoot(vm_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Outcome-Focused Tools (Declarative/Idempotent Operations)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@audited_tool
+async def ensure_vm_running(vm_name: str, host: str = "") -> str:
+    """Ensure a VM is in running state (idempotent operation).
+    
+    If the VM is already running, returns success. If stopped, starts it.
+    
+    Args:
+        vm_name: Name of the virtual machine
+        host: Target KVM host (empty for default)
+    """
+    validate_vm_name(vm_name)
+    svc = _services().kvm_service
+    
+    # Check current state
+    rc, vm = await asyncio.to_thread(svc.get_vm_status, vm_name, host)
+    if rc != 0:
+        return "Failed to check VM status"
+    if vm is None:
+        return f"VM '{vm_name}' not found"
+    
+    if vm["status"] == "running":
+        return f"VM '{vm_name}' is already running"
+    
+    # Start the VM
+    rc, stdout, stderr = await asyncio.to_thread(svc.start_vm, vm_name, host)
+    if rc != 0:
+        return _format_error("start VM", stderr)
+    return f"VM '{vm_name}' is now running"
+
+
+@mcp.tool()
+@audited_tool
+async def ensure_vm_stopped(vm_name: str, force: bool = False, host: str = "", confirm: bool = False) -> str:
+    """Ensure a VM is in stopped state (idempotent operation).
+    
+    If the VM is already stopped, returns success. If running, stops it.
+    
+    Args:
+        vm_name: Name of the virtual machine
+        force: If True, force stop (destroy) the VM instead of graceful shutdown
+        host: Target KVM host (empty for default)
+        confirm: Set to True to confirm force stop operation
+    """
+    validate_vm_name(vm_name)
+    svc = _services().kvm_service
+    
+    # Check current state
+    rc, vm = await asyncio.to_thread(svc.get_vm_status, vm_name, host)
+    if rc != 0:
+        return "Failed to check VM status"
+    if vm is None:
+        return f"VM '{vm_name}' not found"
+    
+    if vm["status"] != "running":
+        return f"VM '{vm_name}' is already stopped"
+    
+    # Require confirmation for force stop
+    if force and not confirm:
+        return _requires_confirmation(
+            f"Force stop VM '{vm_name}'",
+            f"Force stop may cause data loss or corruption. VM: {vm_name}, Host: {host or 'default'}"
+        )
+    
+    # Stop the VM
+    rc, stdout, stderr = await asyncio.to_thread(svc.stop_vm, vm_name, force, host)
+    if rc != 0:
+        return _format_error("stop VM", stderr)
+    return f"VM '{vm_name}' is now stopped"
+
+
+@mcp.tool()
+@audited_tool
+async def ensure_vm_exists(
+    vm_name: str,
+    memory_mb: int = 2048,
+    vcpus: int = 2,
+    disk_size_gb: int = 20,
+    disk_path: str = "/var/lib/libvirt/images",
+    iso_path: Optional[str] = None,
+    os_variant: Optional[str] = None,
+    host: str = "",
+) -> str:
+    """Ensure a VM exists with specified configuration (idempotent operation).
+    
+    If the VM already exists, returns success. If not, creates it.
+    
+    Args:
+        vm_name: Name for the VM
+        memory_mb: Memory allocation in MB
+        vcpus: Number of virtual CPUs
+        disk_size_gb: Disk size in GB
+        disk_path: Base directory for the disk image
+        iso_path: Path to ISO image for OS installation (optional)
+        os_variant: OS variant hint for virt-install
+        host: Target KVM host (empty for default)
+    """
+    validate_vm_name(vm_name)
+    svc = _services().kvm_service
+    
+    # Check if VM already exists
+    rc, vm = await asyncio.to_thread(svc.get_vm_status, vm_name, host)
+    if rc == 0 and vm is not None:
+        return f"VM '{vm_name}' already exists with status: {vm['status']}"
+    
+    # Create the VM
+    disk_file = f"{disk_path}/{vm_name}.qcow2"
+    rc, _, stderr = await asyncio.to_thread(svc.create_vm_disk, disk_file, disk_size_gb, host)
+    if rc != 0:
+        return _format_error("create disk", stderr)
+
+    rc, _, stderr = await asyncio.to_thread(
+        svc.create_vm,
+        vm_name=vm_name, memory_mb=memory_mb, vcpus=vcpus,
+        disk_path=disk_file, iso_path=iso_path, os_variant=os_variant, host=host,
+    )
+    if rc != 0:
+        return _format_error("create VM", stderr)
+    return f"VM '{vm_name}' has been created successfully"
+
+
+@mcp.tool()
+@audited_tool
+async def ensure_snapshot_exists(
+    vm_name: str, snapshot_name: str, description: Optional[str] = None, host: str = "",
+) -> str:
+    """Ensure a snapshot exists for a VM (idempotent operation).
+    
+    If the snapshot already exists, returns success. If not, creates it.
+    
+    Args:
+        vm_name: Name of the virtual machine
+        snapshot_name: Name for the snapshot
+        description: Optional description for the snapshot
+        host: Target KVM host (empty for default)
+    """
+    validate_vm_name(vm_name)
+    validate_snapshot_name(snapshot_name)
+    svc = _services().kvm_service
+    
+    # Check if snapshot already exists
+    rc, snapshots = await asyncio.to_thread(svc.list_snapshots, vm_name, host)
+    if rc != 0:
+        return "Failed to list snapshots"
+    
+    for snapshot in snapshots:
+        if snapshot["name"] == snapshot_name:
+            return f"Snapshot '{snapshot_name}' already exists for VM '{vm_name}'"
+    
+    # Create the snapshot
+    rc, _, stderr = await asyncio.to_thread(
+        svc.create_snapshot, vm_name, snapshot_name, host, description,
+    )
+    if rc != 0:
+        return _format_error("create snapshot", stderr)
+    return f"Snapshot '{snapshot_name}' has been created for VM '{vm_name}'"
+
+
+@mcp.tool()
+@audited_tool
+async def ensure_disk_attached(vm_name: str, disk_path: str, host: str = "") -> str:
+    """Ensure a disk is attached to a VM (idempotent operation).
+    
+    If the disk is already attached, returns success. If not, attaches it.
+    
+    Args:
+        vm_name: Name of the virtual machine
+        disk_path: Path to the disk file
+        host: Target KVM host (empty for default)
+    """
+    validate_vm_name(vm_name)
+    svc = _services().kvm_service
+    
+    # Check if disk is already attached
+    rc, disks = await asyncio.to_thread(svc.list_disks, vm_name, host)
+    if rc != 0:
+        return "Failed to list VM disks"
+    
+    for disk in disks:
+        if disk.get("source") == disk_path:
+            return f"Disk '{disk_path}' is already attached to VM '{vm_name}'"
+    
+    # Attach the disk
+    rc, _, stderr = await asyncio.to_thread(svc.attach_disk, vm_name, disk_path, host)
+    if rc != 0:
+        return _format_error("attach disk", stderr)
+    return f"Disk '{disk_path}' has been attached to VM '{vm_name}'"
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    from app.transport.http import get_transport_config
+    
+    # Get transport configuration
+    transport_config = get_transport_config()
+    
+    # Run server with configured transport
+    mcp.run(**transport_config)

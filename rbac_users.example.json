@@ -1,0 +1,64 @@
+{
+  "users": [
+    {
+      "id": "admin",
+      "name": "System Administrator",
+      "email": "admin@example.com",
+      "roles": ["admin"],
+      "custom_permissions": [],
+      "host_restrictions": [],
+      "vm_name_patterns": [],
+      "enabled": true
+    },
+    {
+      "id": "ops-team",
+      "name": "Operations Team",
+      "email": "ops@example.com",
+      "roles": ["operator"],
+      "custom_permissions": [],
+      "host_restrictions": ["production", "staging"],
+      "vm_name_patterns": ["prod-.*", "stage-.*"],
+      "enabled": true
+    },
+    {
+      "id": "developer",
+      "name": "Development Team",
+      "email": "dev@example.com",
+      "roles": ["developer"],
+      "custom_permissions": [],
+      "host_restrictions": ["development"],
+      "vm_name_patterns": ["dev-.*", "test-.*", "temp-.*"],
+      "enabled": true
+    },
+    {
+      "id": "monitoring",
+      "name": "Monitoring Service",
+      "email": "monitoring@example.com",
+      "roles": ["viewer"],
+      "custom_permissions": [],
+      "host_restrictions": [],
+      "vm_name_patterns": [],
+      "enabled": true
+    },
+    {
+      "id": "guest-user",
+      "name": "Guest User",
+      "email": "guest@example.com",
+      "roles": ["guest"],
+      "custom_permissions": [],
+      "host_restrictions": [],
+      "vm_name_patterns": [],
+      "enabled": true
+    },
+    {
+      "id": "backup-service",
+      "name": "Backup Service Account",
+      "email": "backup@example.com",
+      "roles": ["viewer"],
+      "custom_permissions": ["snapshot:create", "snapshot:list"],
+      "host_restrictions": [],
+      "vm_name_patterns": [],
+      "enabled": true
+    }
+  ]
+}

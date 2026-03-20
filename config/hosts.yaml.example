@@ -1,0 +1,32 @@
+# Multi-host KVM configuration for Docker deployment
+# Copy this file to hosts.yaml and customize for your environment
+
+default_host: production
+
+hosts:
+  - name: production
+    uri: qemu+ssh://root@prod-kvm.local/system
+    ssh_user: root
+    ssh_key: /root/.ssh/prod_rsa
+    allowed_disk_paths: /var/lib/libvirt/images,/storage/vms
+    allowed_iso_paths: /var/lib/libvirt/images,/storage/iso
+  
+  - name: development
+    uri: qemu+ssh://admin@dev-kvm.local/system
+    ssh_user: admin
+    ssh_key: /root/.ssh/dev_rsa
+    allowed_disk_paths: /var/lib/libvirt/images
+    allowed_iso_paths: /var/lib/libvirt/images,/home/admin/iso
+  
+  - name: testing
+    uri: qemu+ssh://test@test-kvm.local/system
+    ssh_user: test
+    ssh_key: /root/.ssh/test_rsa
+    allowed_disk_paths: /var/lib/libvirt/images
+    allowed_iso_paths: /var/lib/libvirt/images
+
+# Security considerations for Docker deployment:
+# 1. SSH keys should be mounted read-only into /root/.ssh
+# 2. This config file should be mounted read-only into /app/config/
+# 3. Use RBAC settings in environment variables to control access
+# 4. Audit logs are written to /var/log/kvm-mcp/ volume

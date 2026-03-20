@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "kvm-manager": {
-      "command": "python",
+      "command": "/home/stratus/git_projects/kvm-mcp/.venv/bin/python",
       "args": ["-m", "app.mcp_server"],
-      "cwd": "/home/stratus/git_projects/linux-helpers/kvm-mcp",
+      "cwd": "/home/stratus/git_projects/kvm-mcp",
       "env": {
         "KVM_DISABLE_SUDO": "false"
       }

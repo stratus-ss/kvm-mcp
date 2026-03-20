@@ -156,6 +156,28 @@ class GuestAgentService:
                 f"Public key must start with one of: {', '.join(valid_prefixes)}"
             )
 
+    def set_hostname(
+        self, vm_name: str, hostname: str, host: str = "", timeout: int = 30,
+    ) -> tuple[int, dict[str, Any]]:
+        """Set the hostname inside the guest via hostnamectl."""
+        if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$', hostname):
+            return 1, {"error": "Invalid hostname"}
+        ga_cmd = {
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "/usr/bin/hostnamectl",
+                "arg": ["set-hostname", hostname],
+                "capture-output": True,
+            },
+        }
+        rc, response = self._agent_command(vm_name, ga_cmd, host, timeout)
+        if rc != 0:
+            return rc, response
+        pid = response.get("return", {}).get("pid")
+        if pid is not None:
+            return self._get_exec_result(vm_name, pid, host, timeout)
+        return rc, response
+
     def setup_ssh_key(
         self, vm_name: str, public_key: str, host: str = "", timeout: int = 30,
     ) -> tuple[int, dict[str, Any]]:
