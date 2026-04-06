@@ -179,21 +179,31 @@ class GuestAgentService:
         return rc, response
 
     def setup_ssh_key(
-        self, vm_name: str, public_key: str, host: str = "", timeout: int = 30,
+        self,
+        vm_name: str,
+        public_key: str,
+        host: str = "",
+        timeout: int = 30,
+        username: str = "root",
     ) -> tuple[int, dict[str, Any]]:
-        """Inject an SSH public key into root's authorized_keys via guest agent."""
+        """Inject an SSH public key into the specified user's authorized_keys via guest agent."""
         self._validate_ssh_public_key(public_key)
+        if not username or "/" in username or username in (".", ".."):
+            raise ValueError(f"Invalid username: {username!r}")
+        home_dir = "/root" if username == "root" else f"/home/{username}"
         encoded_key = base64.b64encode((public_key.strip() + "\n").encode()).decode()
+        ssh_dir = f"{home_dir}/.ssh"
+        auth_keys = f"{ssh_dir}/authorized_keys"
+        shell_cmd = (
+            f"mkdir -p {ssh_dir} && chmod 700 {ssh_dir} "
+            f"&& cat >> {auth_keys} "
+            f"&& chmod 600 {auth_keys}"
+        )
         ga_cmd = {
             "execute": "guest-exec",
             "arguments": {
                 "path": "/bin/sh",
-                "arg": [
-                    "-c",
-                    "mkdir -p /root/.ssh && chmod 700 /root/.ssh "
-                    "&& cat >> /root/.ssh/authorized_keys "
-                    "&& chmod 600 /root/.ssh/authorized_keys",
-                ],
+                "arg": ["-c", shell_cmd],
                 "input-data": encoded_key,
                 "capture-output": True,
             },

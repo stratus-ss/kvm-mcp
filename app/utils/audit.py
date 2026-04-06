@@ -1,4 +1,4 @@
-"""Structured audit logging for MCP server operations."""
+"""Structured audit logging and tool metrics for MCP server operations."""
 
 import functools
 import json
@@ -8,8 +8,14 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
 
+from app.utils.tool_metrics import ToolMetricsRecorder
+
 _AUDIT_LOG_DIR = os.environ.get("MCP_AUDIT_LOG_DIR", "/var/log/kvm-mcp")
 _AUDIT_LOG_FILE = os.path.join(_AUDIT_LOG_DIR, "mcp-audit.jsonl")
+_METRICS_PATH = os.environ.get(
+    "TOOL_METRICS_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "tool-metrics.jsonl"),
+)
 _MAX_BYTES = 10 * 1024 * 1024  # 10 MB per file
 _BACKUP_COUNT = 5
 
@@ -87,10 +93,16 @@ def _sanitise_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 _audit = AuditLogger()
+_metrics = ToolMetricsRecorder(history_path=_METRICS_PATH)
+
+
+def get_metrics() -> ToolMetricsRecorder:
+    """Return the global metrics recorder for use by MCP tool handlers."""
+    return _metrics
 
 
 def audited_tool(fn: Callable) -> Callable:
-    """Decorator that wraps an async MCP tool handler with audit logging."""
+    """Decorator that wraps an async MCP tool handler with audit logging and metrics."""
 
     @functools.wraps(fn)
     async def wrapper(**kwargs: Any) -> str:
@@ -104,6 +116,12 @@ def audited_tool(fn: Callable) -> Callable:
                 result=result,
                 duration_ms=elapsed,
             )
+            _metrics.record(
+                tool_name=fn.__name__,
+                result=result,
+                duration_ms=int(elapsed),
+                success=True,
+            )
             return result
         except Exception as exc:
             elapsed = (time.monotonic() - start) * 1000
@@ -112,6 +130,12 @@ def audited_tool(fn: Callable) -> Callable:
                 args=kwargs,
                 error=str(exc),
                 duration_ms=elapsed,
+            )
+            _metrics.record(
+                tool_name=fn.__name__,
+                result=str(exc),
+                duration_ms=int(elapsed),
+                success=False,
             )
             raise
 

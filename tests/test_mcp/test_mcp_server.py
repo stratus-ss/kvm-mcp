@@ -86,7 +86,7 @@ def _apply_ga_mocks(m):
         0,
         {"exited": True, "exitcode": 0, "out-data": "dGVzdCBvdXRwdXQ=", "err-data": ""},
     )
-    m.setup_ssh_key = lambda name, key, host="", timeout=30: (0, {"exited": True, "exitcode": 0})
+    m.setup_ssh_key = lambda name, key, host="", timeout=30, username="root": (0, {"exited": True, "exitcode": 0})
 
 
 def _apply_conn_mgr_mocks(m):
@@ -102,14 +102,17 @@ def _text(result) -> str:
 # ── Discovery tests ──────────────────────────────────────────────────────
 
 @pytest.mark.anyio
-async def test_lists_all_28_tools():
+async def test_lists_all_tools():
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
-    assert len(names) == 28
+    assert len(names) == 36
     assert "kvm_list_vms" in names
     assert "guest_exec" in names
     assert "kvm_list_hosts" in names
     assert "kvm_fleet_status" in names
+    assert "get_tool_metrics" in names
+    assert "query_tool_metrics_history" in names
+    assert "ensure_vm_running" in names
 
 
 @pytest.mark.anyio
@@ -256,11 +259,20 @@ async def test_restart_vm():
 
 
 @pytest.mark.anyio
-async def test_delete_vm_stopped():
+async def test_delete_vm_requires_confirmation():
     kvm = _make_mock()
     _apply_kvm_mocks(kvm)
     with patch(KVM_SVC, kvm):
         result = await mcp.call_tool("kvm_delete_vm", {"vm_name": "db-server"})
+        assert "CONFIRMATION REQUIRED" in _text(result)
+
+
+@pytest.mark.anyio
+async def test_delete_vm_confirmed():
+    kvm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    with patch(KVM_SVC, kvm):
+        result = await mcp.call_tool("kvm_delete_vm", {"vm_name": "db-server", "confirm": True})
         assert "deleted successfully" in _text(result)
 
 
@@ -361,12 +373,24 @@ async def test_delete_snapshot():
 
 
 @pytest.mark.anyio
-async def test_restore_snapshot():
+async def test_restore_snapshot_requires_confirmation():
     kvm = _make_mock()
     _apply_kvm_mocks(kvm)
     with patch(KVM_SVC, kvm):
         result = await mcp.call_tool(
-            "kvm_restore_snapshot", {"vm_name": "web-server", "snapshot_name": "snap1"}
+            "kvm_restore_snapshot", {"vm_name": "db-server", "snapshot_name": "snap1"}
+        )
+        assert "CONFIRMATION REQUIRED" in _text(result)
+
+
+@pytest.mark.anyio
+async def test_restore_snapshot_confirmed():
+    kvm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    with patch(KVM_SVC, kvm):
+        result = await mcp.call_tool(
+            "kvm_restore_snapshot",
+            {"vm_name": "db-server", "snapshot_name": "snap1", "confirm": True},
         )
         assert "restored" in _text(result)
 
@@ -704,3 +728,98 @@ async def test_resource_storage_pools():
         assert len(data) == 1
         assert data[0]["name"] == "default"
         assert data[0]["available_gb"] > 0
+
+
+# ── Fleet summary tests ───────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_fleet_status_summary():
+    kvm = _make_mock()
+    cm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    _apply_conn_mgr_mocks(cm)
+    with patch(KVM_SVC, kvm), patch(CONN_MGR, cm):
+        result = await mcp.call_tool("kvm_fleet_status", {"summary": True})
+        data = json.loads(_text(result))
+        assert data[0]["running"] == 1
+        assert data[0]["stopped"] == 1
+        assert data[0]["total"] == 2
+        assert "vms" not in data[0]
+
+
+# ── List VMs filter tests ────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_list_vms_name_filter():
+    kvm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    with patch(KVM_SVC, kvm):
+        result = await mcp.call_tool("kvm_list_vms", {"name_filter": "web"})
+        data = json.loads(_text(result))
+        assert len(data) == 1
+        assert data[0]["name"] == "web-server"
+
+
+@pytest.mark.anyio
+async def test_list_vms_status_filter():
+    kvm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    with patch(KVM_SVC, kvm):
+        result = await mcp.call_tool("kvm_list_vms", {"status_filter": "running"})
+        data = json.loads(_text(result))
+        assert len(data) == 1
+        assert data[0]["status"] == "running"
+
+
+# ── Guest exec truncation tests ──────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_guest_exec_truncation():
+    ga = _make_mock()
+    import base64
+    long_output = "\n".join(f"line {i}" for i in range(200))
+    encoded = base64.b64encode(long_output.encode()).decode()
+    ga.execute_command = lambda name, cmd, host="", timeout=300: (
+        0, {"exited": True, "exitcode": 0, "out-data": encoded, "err-data": ""},
+    )
+    with patch(GA_SVC, ga):
+        result = await mcp.call_tool(
+            "guest_exec", {"vm_name": "web-server", "command": "ps aux", "max_lines": 10}
+        )
+        data = json.loads(_text(result))
+        assert data["truncated"] is True
+        assert "190 lines truncated" in data["stdout"]
+
+
+# ── Compact JSON tests ───────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_responses_are_compact_json():
+    """Verify JSON responses contain no pretty-print whitespace."""
+    kvm = _make_mock()
+    _apply_kvm_mocks(kvm)
+    with patch(KVM_SVC, kvm):
+        result = await mcp.call_tool("kvm_list_vms", {})
+        text = _text(result)
+        assert "\n" not in text
+        assert "  " not in text
+
+
+# ── Metrics tool tests ───────────────────────────────────────────────────
+
+@pytest.mark.anyio
+async def test_get_tool_metrics():
+    result = await mcp.call_tool("get_tool_metrics", {"limit": 5})
+    data = json.loads(_text(result))
+    assert "records" in data
+    assert "summary" in data
+    assert data["limit"] == 5
+
+
+@pytest.mark.anyio
+async def test_query_tool_metrics_history():
+    result = await mcp.call_tool("query_tool_metrics_history", {"limit": 10})
+    data = json.loads(_text(result))
+    assert "records" in data
+    assert "summary" in data
+    assert "filters" in data

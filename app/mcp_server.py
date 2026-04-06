@@ -9,108 +9,39 @@ from mcp.server.fastmcp import FastMCP
 
 from app.dependencies import get_services
 from app.models.vm import validate_vm_name, validate_snapshot_name
-from app.utils.audit import audited_tool, audited_resource
+from app.utils.audit import audited_tool, audited_resource, get_metrics
 from app.utils.rbac_auth import rbac_protected, viewer_or_higher, operator_or_higher
 from app.config import get_settings
 from app.middleware.rbac import create_rbac_middleware
 
+
+def _json(data: object) -> str:
+    """Compact JSON serialization to minimise token usage."""
+    return json.dumps(data, separators=(",", ":"))
+
 SERVER_INSTRUCTIONS = """\
-MCP server for managing KVM/libvirt virtual machines across one or more hosts.
+KVM/libvirt VM management server. Every tool accepts optional `host` (empty = default).
 
-## Multi-host support
-Every tool accepts an optional `host` parameter.  Leave it empty to target the
-default host.  Use `kvm_list_hosts` to discover available hosts and
-`kvm_fleet_status` to get a combined overview of all hosts in one call.
+Naming: VM/snapshot names allow alphanumeric, dots, underscores, hyphens (max 64 chars).
 
-## Naming rules
-- VM and snapshot names: alphanumeric, dots, underscores, hyphens only (max 64 chars).
-- Disk images default to /var/lib/libvirt/images/<vm_name>.qcow2.
+| Category | Tools |
+|----------|-------|
+| Fleet | kvm_list_hosts, kvm_fleet_status |
+| VM lifecycle | kvm_list_vms, kvm_get_vm_status, kvm_start_vm, kvm_stop_vm, kvm_restart_vm, kvm_create_vm, kvm_delete_vm, kvm_clone_vm |
+| Boot order | kvm_get_boot_order, kvm_set_boot_order |
+| Snapshots | kvm_create_snapshot, kvm_list_snapshots, kvm_delete_snapshot, kvm_restore_snapshot |
+| Disks | kvm_list_disks, kvm_attach_disk, kvm_detach_disk, kvm_resize_disk |
+| Networks | kvm_list_networks, kvm_attach_network, kvm_detach_network |
+| Guest agent | guest_ping, guest_get_network, guest_get_ip, guest_exec, guest_inject_ssh_key, guest_set_hostname |
+| Metrics | get_tool_metrics, query_tool_metrics_history |
 
-## Tool categories
-| Category       | Tools |
-|----------------|-------|
-| Fleet          | kvm_list_hosts, kvm_fleet_status |
-| VM lifecycle   | kvm_list_vms, kvm_get_vm_status, kvm_start_vm, kvm_stop_vm, kvm_restart_vm, kvm_create_vm, kvm_delete_vm, kvm_clone_vm |
-| Boot order     | kvm_get_boot_order, kvm_set_boot_order |
-| Snapshots      | kvm_create_snapshot, kvm_list_snapshots, kvm_delete_snapshot, kvm_restore_snapshot |
-| Disks          | kvm_list_disks, kvm_attach_disk, kvm_detach_disk, kvm_resize_disk |
-| Networks       | kvm_list_networks, kvm_attach_network, kvm_detach_network |
-| Guest agent    | guest_ping, guest_get_network, guest_get_ip, guest_exec, guest_inject_ssh_key, guest_set_hostname |
+Constraints: VM must be stopped before delete/restore. guest_exec allowlist only. \
+Shell metacharacters and path traversal blocked. Boot order: hd,cdrom / cdrom,hd / network / fd. \
+Disk paths must be under allowed directories.
 
-## Common workflows
-
-### Provision a new VM from ISO
-1. kvm_create_vm(name, iso_path="/path/to.iso", os_variant="ubuntu24.04")
-2. kvm_set_boot_order(name, "cdrom,hd")
-3. kvm_start_vm(name)
-4. After OS install completes, kvm_set_boot_order(name, "hd,cdrom")
-5. kvm_restart_vm(name)
-
-### Provision a VM from an existing template (clone)
-1. kvm_stop_vm(source_vm) if running
-2. kvm_clone_vm(source_vm, new_name)
-3. kvm_start_vm(new_name)
-4. guest_ping(new_name)  -- wait until guest agent responds
-5. guest_inject_ssh_key(new_name, public_key)
-6. guest_get_ip(new_name)
-
-### Safe snapshot and restore
-1. kvm_create_snapshot(vm_name, "before-update")
-2. Perform changes...
-3. If something goes wrong:
-   a. kvm_stop_vm(vm_name)
-   b. kvm_restore_snapshot(vm_name, "before-update")
-   c. kvm_start_vm(vm_name)
-
-### Delete a VM cleanly
-1. kvm_stop_vm(vm_name) or kvm_stop_vm(vm_name, force=True)
-2. kvm_delete_vm(vm_name, remove_storage=True)
-
-### Investigate a running VM
-1. kvm_get_vm_status(vm_name)
-2. guest_ping(vm_name)
-3. guest_exec(vm_name, "df -h")
-4. guest_exec(vm_name, "free -m")
-5. guest_exec(vm_name, "uname -a")
-
-### Resize a VM disk
-1. kvm_stop_vm(vm_name) if running
-2. kvm_create_snapshot(vm_name, "pre-resize") as safety backup
-3. kvm_resize_disk(vm_name, new_size_gb)
-4. kvm_start_vm(vm_name)
-5. guest_exec(vm_name, "lsblk") to verify new size visible in guest
-
-### Network troubleshooting
-1. kvm_get_vm_status(vm_name) -- confirm running
-2. guest_ping(vm_name) -- check guest agent
-3. guest_exec(vm_name, "ip -br addr") -- interface state
-4. guest_exec(vm_name, "ip route") -- routing table
-5. guest_exec(vm_name, "cat /etc/resolv.conf") -- DNS config
-6. guest_exec(vm_name, "ss -tlnp") -- listening services
-
-### Fleet audit
-1. kvm_list_hosts() + kvm_fleet_status() -- overview of all hosts
-2. For each running VM: kvm_list_snapshots() -- check backup coverage
-3. Read kvm://storage-pools -- check available space
-
-## Constraints
-- A VM must be stopped before it can be deleted or restored from a snapshot.
-- guest_exec allows: ls, pwd, whoami, date, uname, hostname, df, free, ps, ip, \
-uptime, head, tail, wc, sort, uniq, which, type, cat, systemctl, journalctl, \
-grep, ss, lsblk, lscpu, mount, id, stat, findmnt.
-- Shell metacharacters (| & ; ` $ etc.) and path traversal (..) are blocked.
-- Boot order values: 'hd,cdrom', 'cdrom,hd', 'network', 'fd'.
-- Disk paths must be under the configured allowed directories.
-
-## Resources (read-only)
-- kvm://hosts                      -- all configured hosts with connection status
-- kvm://vms                        -- all VMs on the default host
-- kvm://networks                   -- all libvirt networks on the default host
-- kvm://storage-pools              -- storage pools with capacity/available space
-- kvm://vms/{vm_name}              -- detailed VM info
-- kvm://vms/{vm_name}/snapshots    -- snapshot list for a VM
-- kvm://vms/{vm_name}/disks        -- disk layout for a VM
-- kvm://hosts/{host_name}/vms      -- all VMs on a specific host
+Token tips: prefer guest_get_ip over guest_get_network; use kvm_fleet_status(summary=True) \
+for counts; use kvm_list_vms(name_filter/status_filter) to narrow results; \
+guest_exec has max_lines (default 100) to cap output.
 """
 
 mcp = FastMCP("KVM Manager", instructions=SERVER_INSTRUCTIONS)
@@ -133,6 +64,24 @@ def _apply_rbac_if_enabled(tool_name: str):
     def decorator(func):
         return rbac_protected(tool_name)(func)
     return decorator
+
+
+def _truncate_output(
+    stdout: str | None, stderr: str | None, max_lines: int,
+) -> tuple[str | None, str | None, bool]:
+    """Truncate stdout/stderr to max_lines; return (stdout, stderr, was_truncated)."""
+    truncated = False
+    for text, label in [(stdout, "stdout"), (stderr, "stderr")]:
+        if text and max_lines > 0:
+            lines = text.splitlines(True)
+            if len(lines) > max_lines:
+                text = "".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} lines truncated)"
+                truncated = True
+            if label == "stdout":
+                stdout = text
+            else:
+                stderr = text
+    return stdout, stderr, truncated
 
 
 def _requires_confirmation(operation: str, details: str) -> str:
@@ -158,23 +107,37 @@ async def kvm_list_hosts() -> str:
     """List all configured KVM hosts with their connection status."""
     conn_mgr = _services().connection_manager
     hosts = await asyncio.to_thread(conn_mgr.list_hosts)
-    return json.dumps(hosts, indent=2)
+    return _json(hosts)
 
 
 @mcp.tool()
 @audited_tool
-async def kvm_fleet_status() -> str:
-    """Get a combined overview of all VMs across every configured host."""
+async def kvm_fleet_status(summary: bool = False, host: str = "") -> str:
+    """Get a combined overview of all VMs across every configured host.
+
+    Args:
+        summary: If True, return per-host counts instead of full VM lists (saves tokens)
+        host: Target a single KVM host (empty for all hosts)
+    """
     svc = _services().kvm_service
     conn_mgr = _services().connection_manager
     hosts = await asyncio.to_thread(conn_mgr.list_hosts)
+    if host:
+        hosts = [h for h in hosts if h["name"] == host]
 
     async def _query(h: dict) -> dict:
         rc, vms = await asyncio.to_thread(svc.list_vms, host=h["name"], all_vms=True)
-        return {"host": h["name"], "status": h["status"], "vms": vms if rc == 0 else []}
+        vms = vms if rc == 0 else []
+        if summary:
+            running = sum(1 for v in vms if v.get("status") == "running")
+            return {
+                "host": h["name"], "status": h["status"],
+                "total": len(vms), "running": running, "stopped": len(vms) - running,
+            }
+        return {"host": h["name"], "status": h["status"], "vms": vms}
 
     results = await asyncio.gather(*[_query(h) for h in hosts])
-    return json.dumps(list(results), indent=2)
+    return _json(list(results))
 
 
 # ---------------------------------------------------------------------------
@@ -183,17 +146,25 @@ async def kvm_fleet_status() -> str:
 
 @mcp.tool()
 @audited_tool
-async def kvm_list_vms(host: str = "") -> str:
-    """List all KVM virtual machines with their IDs and statuses.
+async def kvm_list_vms(host: str = "", name_filter: str = "", status_filter: str = "") -> str:
+    """List KVM virtual machines with their IDs and statuses.
 
     Args:
         host: Target KVM host (empty for default)
+        name_filter: Only return VMs whose name contains this substring (case-insensitive)
+        status_filter: Only return VMs matching this status (e.g. 'running', 'shut off')
     """
     svc = _services().kvm_service
     rc, vms = await asyncio.to_thread(svc.list_vms, host=host, all_vms=True)
     if rc != 0:
         return "Failed to list VMs"
-    return json.dumps(vms, indent=2)
+    if name_filter:
+        nf = name_filter.lower()
+        vms = [v for v in vms if nf in v.get("name", "").lower()]
+    if status_filter:
+        sf = status_filter.lower()
+        vms = [v for v in vms if v.get("status", "").lower() == sf]
+    return _json(vms)
 
 
 @mcp.tool()
@@ -223,7 +194,7 @@ async def kvm_get_vm_status(vm_name: str, host: str = "") -> str:
             ip_address = ip
 
     result = {**vm, "running": running, "ip_address": ip_address}
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -434,9 +405,8 @@ async def kvm_clone_vm(
 
     rc, vm = await asyncio.to_thread(svc.get_vm_status, target_name, host)
     if rc == 0 and vm is not None:
-        return json.dumps(
+        return _json(
             {"message": f"VM '{source_vm_name}' cloned to '{target_name}'", "vm": vm},
-            indent=2,
         )
     return f"VM '{source_vm_name}' cloned to '{target_name}'"
 
@@ -529,7 +499,7 @@ async def kvm_list_snapshots(vm_name: str, host: str = "") -> str:
     rc, snapshots = await asyncio.to_thread(svc.list_snapshots, vm_name, host)
     if rc != 0:
         return "Failed to list snapshots"
-    return json.dumps({"vm": vm_name, "snapshots": snapshots}, indent=2)
+    return _json({"vm": vm_name, "snapshots": snapshots})
 
 
 @mcp.tool()
@@ -603,7 +573,7 @@ async def kvm_list_disks(vm_name: str, host: str = "") -> str:
     rc, disks = await asyncio.to_thread(svc.list_disks, vm_name, host)
     if rc != 0:
         return "Failed to list disks"
-    return json.dumps({"vm": vm_name, "disks": disks}, indent=2)
+    return _json({"vm": vm_name, "disks": disks})
 
 
 @mcp.tool()
@@ -688,7 +658,7 @@ async def kvm_list_networks(host: str = "") -> str:
     rc, networks = await asyncio.to_thread(svc.list_networks, host)
     if rc != 0:
         return "Failed to list networks"
-    return json.dumps(networks, indent=2)
+    return _json(networks)
 
 
 @mcp.tool()
@@ -758,6 +728,9 @@ async def guest_ping(vm_name: str, host: str = "") -> str:
 async def guest_get_network(vm_name: str, host: str = "") -> str:
     """Get network interface information from inside the VM via guest agent.
 
+    Returns name, hardware-address, and ip-addresses per interface (stats stripped).
+    For just the primary IP, use guest_get_ip instead (much cheaper).
+
     Args:
         vm_name: Name of the virtual machine
         host: Target KVM host (empty for default)
@@ -768,8 +741,14 @@ async def guest_get_network(vm_name: str, host: str = "") -> str:
     if rc != 0:
         error = response.get("error", "unknown error")
         return f"Failed to get network interfaces: {error}"
-    interfaces = response.get("return", [])
-    return json.dumps(interfaces, indent=2)
+    compact = []
+    for iface in response.get("return", []):
+        compact.append({
+            "name": iface.get("name"),
+            "hardware-address": iface.get("hardware-address"),
+            "ip-addresses": iface.get("ip-addresses", []),
+        })
+    return _json(compact)
 
 
 @mcp.tool()
@@ -791,7 +770,7 @@ async def guest_get_ip(vm_name: str, host: str = "") -> str:
 
 @mcp.tool()
 @audited_tool
-async def guest_exec(vm_name: str, command: str, host: str = "") -> str:
+async def guest_exec(vm_name: str, command: str, host: str = "", max_lines: int = 100) -> str:
     """Execute a command inside a VM via the QEMU guest agent.
 
     Allowlisted commands: ls, pwd, whoami, date, uname, hostname, df, free, ps,
@@ -803,6 +782,7 @@ async def guest_exec(vm_name: str, command: str, host: str = "") -> str:
         vm_name: Name of the virtual machine
         command: Command to execute (e.g. 'uname -a', 'df -h', 'cat /etc/os-release')
         host: Target KVM host (empty for default)
+        max_lines: Truncate stdout/stderr to this many lines (0 = unlimited)
     """
     validate_vm_name(vm_name)
     svc = _services().guest_agent_service
@@ -830,16 +810,24 @@ async def guest_exec(vm_name: str, command: str, host: str = "") -> str:
         except Exception:
             pass
 
-    return json.dumps(
-        {"exit_code": exit_code, "stdout": stdout_data, "stderr": stderr_data},
-        indent=2,
-    )
+    truncated = False
+    if max_lines > 0:
+        stdout_data, stderr_data, truncated = _truncate_output(
+            stdout_data, stderr_data, max_lines,
+        )
+
+    result = {"exit_code": exit_code, "stdout": stdout_data, "stderr": stderr_data}
+    if truncated:
+        result["truncated"] = True
+    return _json(result)
 
 
 @mcp.tool()
 @audited_tool
-async def guest_inject_ssh_key(vm_name: str, public_key: str, host: str = "") -> str:
-    """Inject an SSH public key into root's authorized_keys inside a VM.
+async def guest_inject_ssh_key(
+    vm_name: str, public_key: str, host: str = "", username: str = "root",
+) -> str:
+    """Inject an SSH public key into a user's authorized_keys inside a VM.
 
     The key is validated for format before injection. Supported key types:
     ssh-rsa, ssh-ed25519, ssh-dss, ecdsa-sha2-*.
@@ -848,12 +836,13 @@ async def guest_inject_ssh_key(vm_name: str, public_key: str, host: str = "") ->
         vm_name: Name of the virtual machine
         public_key: SSH public key string (e.g. 'ssh-ed25519 AAAA... user@host')
         host: Target KVM host (empty for default)
+        username: OS user whose authorized_keys will receive the key (default: root)
     """
     validate_vm_name(vm_name)
     svc = _services().guest_agent_service
     try:
         rc, response = await asyncio.to_thread(
-            svc.setup_ssh_key, vm_name, public_key, host,
+            svc.setup_ssh_key, vm_name, public_key, host, 30, username,
         )
     except ValueError as exc:
         return f"Invalid SSH key: {exc}"
@@ -865,7 +854,7 @@ async def guest_inject_ssh_key(vm_name: str, public_key: str, host: str = "") ->
     exit_code = response.get("exitcode")
     success = exit_code == 0 if exit_code is not None else True
     if success:
-        return f"SSH key injected into VM '{vm_name}' successfully"
+        return f"SSH key injected for user '{username}' in VM '{vm_name}' successfully"
     return f"SSH key injection failed (exit code {exit_code})"
 
 
@@ -904,7 +893,7 @@ async def resource_list_hosts() -> str:
     """All configured KVM hosts with connection status."""
     conn_mgr = _services().connection_manager
     hosts = await asyncio.to_thread(conn_mgr.list_hosts)
-    return json.dumps(hosts, indent=2)
+    return _json(hosts)
 
 
 @mcp.resource("kvm://vms")
@@ -914,8 +903,8 @@ async def resource_list_vms() -> str:
     svc = _services().kvm_service
     rc, vms = await asyncio.to_thread(svc.list_vms, all_vms=True)
     if rc != 0:
-        return json.dumps({"error": "Failed to list VMs"})
-    return json.dumps(vms, indent=2)
+        return _json({"error": "Failed to list VMs"})
+    return _json(vms)
 
 
 @mcp.resource("kvm://networks")
@@ -925,8 +914,8 @@ async def resource_list_networks() -> str:
     svc = _services().kvm_service
     rc, networks = await asyncio.to_thread(svc.list_networks)
     if rc != 0:
-        return json.dumps({"error": "Failed to list networks"})
-    return json.dumps(networks, indent=2)
+        return _json({"error": "Failed to list networks"})
+    return _json(networks)
 
 
 @mcp.resource("kvm://vms/{vm_name}")
@@ -936,7 +925,7 @@ async def resource_vm_detail(vm_name: str) -> str:
     svc = _services()
     rc, vm = await asyncio.to_thread(svc.kvm_service.get_vm_status, vm_name)
     if rc != 0 or vm is None:
-        return json.dumps({"error": f"VM '{vm_name}' not found"})
+        return _json({"error": f"VM '{vm_name}' not found"})
 
     running = vm["status"] == "running"
     ip_address = None
@@ -951,7 +940,7 @@ async def resource_vm_detail(vm_name: str) -> str:
     detail = {**vm, "running": running, "ip_address": ip_address}
     if info_rc == 0 and info:
         detail["info"] = info
-    return json.dumps(detail, indent=2)
+    return _json(detail)
 
 
 @mcp.resource("kvm://vms/{vm_name}/snapshots")
@@ -961,8 +950,8 @@ async def resource_vm_snapshots(vm_name: str) -> str:
     svc = _services().kvm_service
     rc, snapshots = await asyncio.to_thread(svc.list_snapshots, vm_name)
     if rc != 0:
-        return json.dumps({"error": f"Failed to list snapshots for '{vm_name}'"})
-    return json.dumps({"vm": vm_name, "snapshots": snapshots}, indent=2)
+        return _json({"error": f"Failed to list snapshots for '{vm_name}'"})
+    return _json({"vm": vm_name, "snapshots": snapshots})
 
 
 @mcp.resource("kvm://vms/{vm_name}/disks")
@@ -972,8 +961,8 @@ async def resource_vm_disks(vm_name: str) -> str:
     svc = _services().kvm_service
     rc, disks = await asyncio.to_thread(svc.list_disks, vm_name)
     if rc != 0:
-        return json.dumps({"error": f"Failed to list disks for '{vm_name}'"})
-    return json.dumps({"vm": vm_name, "disks": disks}, indent=2)
+        return _json({"error": f"Failed to list disks for '{vm_name}'"})
+    return _json({"vm": vm_name, "disks": disks})
 
 
 @mcp.resource("kvm://hosts/{host_name}/vms")
@@ -983,8 +972,8 @@ async def resource_host_vms(host_name: str) -> str:
     svc = _services().kvm_service
     rc, vms = await asyncio.to_thread(svc.list_vms, host=host_name, all_vms=True)
     if rc != 0:
-        return json.dumps({"error": f"Failed to list VMs on host '{host_name}'"})
-    return json.dumps(vms, indent=2)
+        return _json({"error": f"Failed to list VMs on host '{host_name}'"})
+    return _json(vms)
 
 
 @mcp.resource("kvm://storage-pools")
@@ -994,8 +983,8 @@ async def resource_storage_pools() -> str:
     svc = _services().kvm_service
     rc, pools = await asyncio.to_thread(svc.list_storage_pools)
     if rc != 0:
-        return json.dumps({"error": "Failed to list storage pools"})
-    return json.dumps(pools, indent=2)
+        return _json({"error": "Failed to list storage pools"})
+    return _json(pools)
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1335,53 @@ async def ensure_disk_attached(vm_name: str, disk_path: str, host: str = "") -> 
     if rc != 0:
         return _format_error("attach disk", stderr)
     return f"Disk '{disk_path}' has been attached to VM '{vm_name}'"
+
+
+# ---------------------------------------------------------------------------
+# Metrics Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_tool_metrics(limit: int = 10) -> str:
+    """Return recent in-memory tool call metrics (response size, tokens, duration).
+
+    Args:
+        limit: Number of recent records to return (1-50)
+    """
+    metrics = get_metrics()
+    safe_limit = max(min(limit, 50), 1)
+    records = metrics.get_recent(safe_limit)
+    return _json({"limit": safe_limit, "records": records,
+                   "summary": metrics.summarize(records)})
+
+
+@mcp.tool()
+async def query_tool_metrics_history(
+    tool_name: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Query persisted tool metrics history with optional filters.
+
+    Args:
+        tool_name: Filter to a specific tool name
+        since: ISO-8601 start timestamp
+        until: ISO-8601 end timestamp
+        limit: Max records per page (1-500)
+        offset: Skip first N matching records
+    """
+    metrics = get_metrics()
+    records, summary = metrics.query_history(
+        tool_name=tool_name, since=since, until=until,
+        limit=limit, offset=offset,
+    )
+    return _json({
+        "filters": {"tool_name": tool_name, "since": since, "until": until,
+                     "limit": max(min(limit, 500), 1), "offset": max(offset, 0)},
+        "records": records, "summary": summary,
+    })
 
 
 # ---------------------------------------------------------------------------
