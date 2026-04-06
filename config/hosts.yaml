@@ -1,0 +1,14 @@
+default_host: local
+hosts:
+- allowed_disk_paths: /var/lib/libvirt/images,/var/lib/libvirt/images/infra,/var/lib/libvirt/images/base_images
+  allowed_iso_paths: /var/lib/libvirt/images,/home,/var/lib/libvirt/boot,/var/lib/libvirt/images/infra/iso
+  name: local
+  ssh_key: ~/.ssh/id_rsa
+  ssh_user: root
+  uri: qemu:///system
+- allowed_disk_paths: /var/lib/libvirt/images,/var/lib/libvirt/images/infra,/var/lib/libvirt/images/base_images
+  allowed_iso_paths: /var/lib/libvirt/images,/home,/var/lib/libvirt/boot,/var/lib/libvirt/images/infra/iso
+  name: dl380
+  ssh_key: ~/.ssh/id_rsa
+  ssh_user: root
+  uri: qemu+ssh://root@dl380/system

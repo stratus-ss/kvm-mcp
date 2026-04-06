@@ -1,6 +1,6 @@
 """Dependency injection container for service layer."""
 
-from app.config import get_settings, load_host_configs
+from app.config import get_settings, load_host_configs, resolve_hosts_file_path
 from app.services.connection_manager import ConnectionManager
 from app.services.guest_agent_service import GuestAgentService
 from app.services.kvm_service import KVMService
@@ -19,7 +19,8 @@ class Services:
         if self._conn_mgr is None:
             settings = get_settings()
             hosts, default = load_host_configs(settings)
-            self._conn_mgr = ConnectionManager(hosts, default)
+            hosts_file = resolve_hosts_file_path(settings)
+            self._conn_mgr = ConnectionManager(hosts, default, hosts_file)
         return self._conn_mgr
 
     @property

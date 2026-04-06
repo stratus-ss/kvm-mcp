@@ -7,12 +7,12 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from app.config import HostConfig, get_settings
 from app.dependencies import get_services
+from app.middleware.rbac import create_rbac_middleware
 from app.models.vm import validate_vm_name, validate_snapshot_name
 from app.utils.audit import audited_tool, audited_resource, get_metrics
 from app.utils.rbac_auth import rbac_protected, viewer_or_higher, operator_or_higher
-from app.config import get_settings
-from app.middleware.rbac import create_rbac_middleware
 
 
 def _json(data: object) -> str:
@@ -27,6 +27,7 @@ Naming: VM/snapshot names allow alphanumeric, dots, underscores, hyphens (max 64
 | Category | Tools |
 |----------|-------|
 | Fleet | kvm_list_hosts, kvm_fleet_status |
+| Host mgmt | kvm_add_host, kvm_remove_host, kvm_set_default_host |
 | VM lifecycle | kvm_list_vms, kvm_get_vm_status, kvm_start_vm, kvm_stop_vm, kvm_restart_vm, kvm_create_vm, kvm_delete_vm, kvm_clone_vm |
 | Boot order | kvm_get_boot_order, kvm_set_boot_order |
 | Snapshots | kvm_create_snapshot, kvm_list_snapshots, kvm_delete_snapshot, kvm_restore_snapshot |
@@ -34,6 +35,10 @@ Naming: VM/snapshot names allow alphanumeric, dots, underscores, hyphens (max 64
 | Networks | kvm_list_networks, kvm_attach_network, kvm_detach_network |
 | Guest agent | guest_ping, guest_get_network, guest_get_ip, guest_exec, guest_inject_ssh_key, guest_set_hostname |
 | Metrics | get_tool_metrics, query_tool_metrics_history |
+
+Host management: use kvm_add_host to register new hosts at runtime (no restart needed). \
+Use kvm_set_default_host to change which host is used when host="" is omitted. \
+Changes are persisted to YAML and survive restarts.
 
 Constraints: VM must be stopped before delete/restore. guest_exec allowlist only. \
 Shell metacharacters and path traversal blocked. Boot order: hd,cdrom / cdrom,hd / network / fd. \
@@ -138,6 +143,84 @@ async def kvm_fleet_status(summary: bool = False, host: str = "") -> str:
 
     results = await asyncio.gather(*[_query(h) for h in hosts])
     return _json(list(results))
+
+
+# ---------------------------------------------------------------------------
+# Host Management Tools (runtime add/remove/default -- no restart required)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+@audited_tool
+@rbac_protected("kvm_add_host")
+async def kvm_add_host(
+    name: str,
+    uri: str = "qemu:///system",
+    ssh_user: str = "root",
+    ssh_key: str = "~/.ssh/id_rsa",
+    allowed_disk_paths: str = "/var/lib/libvirt/images",
+    allowed_iso_paths: str = "/var/lib/libvirt/images,/home",
+) -> str:
+    """Register or update a KVM host at runtime (persisted to YAML).
+
+    Args:
+        name: Logical name for the host (e.g. 'dl380', 'localhost')
+        uri: Libvirt URI (e.g. 'qemu:///system', 'qemu+ssh://root@dl380/system')
+        ssh_user: SSH user for remote commands
+        ssh_key: Path to SSH private key
+        allowed_disk_paths: Comma-separated allowed disk directories
+        allowed_iso_paths: Comma-separated allowed ISO directories
+    """
+    config = HostConfig(
+        name=name, uri=uri, ssh_user=ssh_user, ssh_key=ssh_key,
+        allowed_disk_paths=allowed_disk_paths,
+        allowed_iso_paths=allowed_iso_paths,
+    )
+    conn_mgr = _services().connection_manager
+    await asyncio.to_thread(conn_mgr.add_host, config)
+    hosts = await asyncio.to_thread(conn_mgr.list_hosts)
+    return _json({"message": f"Host '{name}' registered", "hosts": hosts})
+
+
+@mcp.tool()
+@audited_tool
+@rbac_protected("kvm_remove_host")
+async def kvm_remove_host(name: str) -> str:
+    """Remove a KVM host from the registry (persisted to YAML).
+
+    Cannot remove the last host or the current default host.
+
+    Args:
+        name: Logical name of the host to remove
+    """
+    conn_mgr = _services().connection_manager
+    try:
+        await asyncio.to_thread(conn_mgr.remove_host, name)
+    except ValueError as exc:
+        return str(exc)
+    hosts = await asyncio.to_thread(conn_mgr.list_hosts)
+    return _json({"message": f"Host '{name}' removed", "hosts": hosts})
+
+
+@mcp.tool()
+@audited_tool
+@rbac_protected("kvm_set_default_host")
+async def kvm_set_default_host(name: str) -> str:
+    """Change the default KVM host used when 'host' is omitted (persisted to YAML).
+
+    Args:
+        name: Logical name of the host to set as default
+    """
+    conn_mgr = _services().connection_manager
+    try:
+        await asyncio.to_thread(conn_mgr.set_default_host, name)
+    except ValueError as exc:
+        return str(exc)
+    hosts = await asyncio.to_thread(conn_mgr.list_hosts)
+    return _json({
+        "message": f"Default host set to '{name}'",
+        "default_host": name,
+        "hosts": hosts,
+    })
 
 
 # ---------------------------------------------------------------------------

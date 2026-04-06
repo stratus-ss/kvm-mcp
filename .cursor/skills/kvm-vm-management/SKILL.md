@@ -23,6 +23,13 @@ alwaysApply: false
 
 All tools accept optional `host` parameter. Leave empty for default host.
 
+### Runtime host management (no restart required)
+- `kvm_add_host(name, uri, ...)` — register a new host at runtime
+- `kvm_remove_host(name)` — remove a host (cannot remove default or last host)
+- `kvm_set_default_host(name)` — change which host is used when `host=""`
+
+Changes are persisted to `config/hosts.yaml` automatically.
+
 ## Decision Tree: Common Tasks
 
 ### Check a VM's status

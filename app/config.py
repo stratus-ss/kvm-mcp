@@ -4,12 +4,16 @@ Includes RBAC configuration adapted from coolnyx/libvirt-mcp-server (MIT License
 See: https://github.com/coolnyx/libvirt-mcp-server
 """
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class HostConfig(BaseModel):
@@ -90,8 +94,6 @@ def load_host_configs(settings: Settings) -> tuple[list[HostConfig], str]:
     """Resolve host configurations. Returns (hosts, default_host_name)."""
     hosts_file = settings.kvm_hosts_file
     if hosts_file and Path(hosts_file).is_file():
-        import yaml
-
         with open(hosts_file) as f:
             data = yaml.safe_load(f) or {}
         hosts = [HostConfig(**h) for h in data.get("hosts", [])]
@@ -117,6 +119,27 @@ def load_host_configs(settings: Settings) -> tuple[list[HostConfig], str]:
         allowed_iso_paths=settings.allowed_iso_paths,
     )
     return [local], "local"
+
+
+def resolve_hosts_file_path(settings: "Settings") -> str:
+    """Return the hosts file path, defaulting to config/hosts.yaml if unset."""
+    if settings.kvm_hosts_file:
+        return settings.kvm_hosts_file
+    return str(Path(__file__).resolve().parent.parent / "config" / "hosts.yaml")
+
+
+def save_hosts_to_yaml(
+    path: Path, hosts: list[HostConfig], default_host: str,
+) -> None:
+    """Persist the current host registry to a YAML file."""
+    data = {
+        "default_host": default_host,
+        "hosts": [h.model_dump() for h in hosts],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    logger.info("Persisted %d host(s) to %s", len(hosts), path)
 
 
 @lru_cache()
